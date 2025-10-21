@@ -1,4 +1,5 @@
 from playwright.sync_api import sync_playwright, Page
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from datetime import datetime, timezone
 from abc import ABC, abstractmethod
 import json
@@ -276,7 +277,10 @@ class TwinSpiresScraper(baseScraper): # twinspires needs headless=False to work 
 
         also_rans_tab = page.locator("cdux-wagering-section-group li#also-rans")
         if not also_rans_tab.locator(":scope.is-selected").count():
-            also_rans_tab.click()
+            try:
+                also_rans_tab.click(timeout=2000, no_wait_after=True)
+            except PlaywrightTimeoutError:
+                return results
 
         page.locator("cdux-wagering-section-group .entry.is-results.finish-order").first.wait_for(state="visible", timeout=10000)
 

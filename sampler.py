@@ -1,6 +1,11 @@
 import random
 from collections import defaultdict
 import logging
+import math
+from itertools import combinations
+import cvxpy as cp
+import numpy as np
+import pandas as pd
 
 # Helper functions
 def dict_to_list(pool):
@@ -74,6 +79,41 @@ def get_show_table(pool, iterations=100000):
 
     return results
 
+def get_show_distribution_with_payout(pool: dict, show_pool: dict, iterations: int = 100000) -> tuple[dict, dict]:
+    """Given win pool, show pool and number of iterations, returns the distribution over show outcomes as well as a vector of profits"""
+    population, weights = dict_to_list(pool)
+    _, show_weights = dict_to_list(show_pool)
+    total_show_pool = sum(show_weights)
+    table = get_ordering_distribution(population, weights, iterations)
+    show_prob_dict = {}
+    show_gain_dict = {}
+    all_show_combo = list(combinations(population, 3))
+    for show in all_show_combo:
+        total_prob = 0
+        show_set = set(show)
+        for perm, prob in table.items():
+            if show_set == set(perm[:3]):
+                total_prob += prob
+        gain_dict = {}
+        total_winnings = total_show_pool*0.8 # takeout assumed to be $20%
+        for horse in show:
+            total_winnings -= show_pool[horse]
+        winnings_per_horse = total_winnings/3
+
+        for horse in population:
+            if horse in show_set:
+                gain_dict[horse] = winnings_per_horse/show_pool[horse]
+            else:
+                gain_dict[horse] = -1.0
+        
+        show_prob_dict[show] = total_prob
+        show_gain_dict[show] = gain_dict
+
+    
+    return show_prob_dict, show_gain_dict 
+
+
+
 ###############################################################################
 ########################## code for comparing tables ##########################
 ###############################################################################
@@ -114,7 +154,7 @@ def get_parimutuel_payout(pool, ordering_prob, show_pool):
             if top3_total <= 0:
                 continue
             
-            prob_win += prob
+            prob_win += prob ################ TODO: THIS IS WRONG!
             payout += (total_show_pool / top3_total) * prob # this computes expected *total return* not just winnings
             payout_given_win += (total_show_pool / top3_total) * prob # this computes expected *total return* given win
         parimutuel_payout[candidate] = payout - 1 # subtract the 1 you bet to get expected winnings
@@ -148,7 +188,7 @@ def get_projected_expectation(pool, method='parimutuel', iterations=100000, show
     if method == 'parimutuel':
         if show_pool is None:
             raise ValueError("show_pool must be provided for parimutuel method.")
-        expectation, expectation_given_win = get_parimutuel_payout(pool, ordering_prob, show_pool)
+        expectation, expectation_given_win = get_parimutuel_payout(pool, ordering_prob, show_pool) ####### TODO: THIS IS WRONG!
 
     elif method == 'odds':
         if odds is None:
@@ -168,7 +208,7 @@ def get_projected_expectation_on_win(pool, method='parimutuel', iterations=10000
     if method == 'parimutuel':
         if show_pool is None:
             raise ValueError("show_pool must be provided for parimutuel method.")
-        _, expectation_given_win = get_parimutuel_payout(pool, ordering_prob, show_pool)
+        _, expectation_given_win = get_parimutuel_payout(pool, ordering_prob, show_pool) ###### TODO: THIS IS WRONG!
 
     elif method == 'odds':
         if odds is None:
@@ -182,44 +222,129 @@ def get_projected_expectation_on_win(pool, method='parimutuel', iterations=10000
     
     return dict(expectation_given_win)
 
-def run_analysis(pool, show_pool) -> list:
+def optimize_show_portfolio(show_prob_dict, show_gain_dict, population, L=1.0, fmax=0.25, epsilon=0.0, solver="ECOS"):
+    """
+    Maximize:   sum_omega pi[omega] * log( 1 + sum_i f_i * r_{i,omega} )
+    s.t.:       0 <= f_i <= fmax,  sum_i f_i <= L,  and 1 + sum_i f_i * r_{i,omega} >= epsilon  for all omega
+
+    Assumes:
+      - show_prob_dict[omega] is float and ~sums to 1.
+      - show_gain_dict[omega][horse] is float net return r_{i,omega} for every horse in population.
+      - population is an iterable of horse IDs (hashable).
+    Returns:
+      - f_dict: {horse -> optimal fraction}
+      - info:   diagnostics dict
+    """
+    horses = list(population)
+    omegas = list(show_prob_dict.keys())
+
+    # Build π and R
+    pi = np.array([show_prob_dict[w] for w in omegas], dtype=float)            # (m,)
+    s = float(pi.sum())
+    if s <= 0:
+        raise ValueError("Sum of probabilities must be positive.")
+    pi = pi / s  # light normalize
+
+    R = np.array([[float(show_gain_dict[w][h]) for h in horses]                # (m, n)
+                  for w in omegas], dtype=float)
+
+    n = len(horses)
+    f = cp.Variable(n, nonneg=True)
+    aff = 1 + R @ f
+
+    objective = cp.Maximize(pi @ cp.log(aff))
+    constraints = [
+        f <= fmax,
+        cp.sum(f) <= L,
+        aff >= epsilon
+    ]
+
+    prob = cp.Problem(objective, constraints)
+    prob.solve(solver=solver)
+
+    if f.value is None:
+        raise RuntimeError(f"Optimization failed (status: {prob.status}).")
+
+    f_vec = np.clip(f.value, 0.0, None)
+    f_dict = {h: round(x, 4) for h, x in zip(horses, f_vec)}
+
+    # simple diagnostics
+    aff_val = 1 + R @ f_vec
+    info = {
+        "status": prob.status,
+        "expected_log_growth": float(np.dot(pi, np.log(aff_val))),
+        "worst_case_wealth_multiplier": float(aff_val.min()),
+        "sum_f": float(f_vec.sum()),
+    }
+
+    return f_dict
+
+def run_analysis(pool: dict, show_pool: dict, print_data: bool = True) -> dict:
+
+    population, _ = dict_to_list(pool)
+
+    show_prob_dict, show_gain_dict = get_show_distribution_with_payout(pool, show_pool)
+    all_show_combo = list(combinations(population, 3))
+
+    f_opt = optimize_show_portfolio(show_prob_dict, show_gain_dict, population)
+
+    return f_opt
+
+'''
+def run_analysis(pool, show_pool, print_data : bool = True) -> list:
     # If the show pool sums to zero, cancel analysis and explain to the user.
     total_show_pool = sum(show_pool.values()) if show_pool else 0
     if total_show_pool == 0:
         print("Show pool total is 0. The parimutuel projected earnings cannot be computed because there is no money in the show pool.")
         print("This usually means the snapshot did not contain valid pool data (e.g., all entries had None), or the bookmaker returned zeros.")
         return []
+    
+    relative_show_pool = get_relative_pool(show_pool)
 
-    # print("Relative Show Pool Distribution:")
-    # print("-")
-    # relative_show_pool = get_relative_pool(show_pool)
-    # print_dictionary(relative_show_pool)
-    # print("---")
-
-    # print("Projected Show Probabilities:")
-    # print("-")
     show_table = get_show_table(pool, 100000)
-    # print_dictionary(show_table)
-    # print("---")
 
-    # print("Projected Expected Earnings (Parimutuel - with 20% takeout):")
-    # print("-")
     projected_exp = get_projected_expectation_on_win(pool, method='parimutuel', iterations=100000, show_pool=show_pool)
-    # for horse, exp in projected_exp.items():
-    #     print(f"{horse}: {(0.8*exp*show_table[horse]):.4f}")
-    # print("---")
+    ################## TODO: THIS IS WRONG!
 
     bets = []
-
-    # print("Good bets (Kelly criterion with 20% takeout):")
-    # print("-")
+    log_growth = []
     for horse, exp in projected_exp.items():
         kelly_fraction = show_table[horse] - (1 - show_table[horse]) / (exp * 0.8)
         if kelly_fraction > 0:
-            # print(f"{horse}: Kelly fraction = {kelly_fraction:.4f}, Expected Earnings = {(0.8*exp*show_table[horse]):.4f}")
-            bets.append({"horse": horse, "bet_size": kelly_fraction})
+            bets.append({"horse": horse, "bet_size": kelly_fraction/4}) # use 1/4 kelly
+            log_growth.append({"horse": horse, "value": show_table[horse]* math.log( 1 + kelly_fraction*projected_exp[horse] ) + (1-show_table[horse])*math.log(1-kelly_fraction) })
     
+    ### strategy is chosen here. TODO: separate
+
+    max_log_growth = 0 # choose a single horse base on max expected log-growth
+    chosen_horse = None
+    for h in log_growth:
+        if h["value"] > max_log_growth:
+            max_log_growth = h["value"]
+            chosen_horse = h["horse"]
+    
+    for bet in bets:
+        if bet["horse"] == chosen_horse:
+            bets = [ {"horse": bet["horse"], "bet_size": bet["bet_size"]} ] 
+            break
+
+    if print_data:
+        print("Relative Show Pool Distribution:")
+        print("-")
+        print_dictionary(relative_show_pool)
+        print("---")
+        print("Projected Show Probabilities:")
+        print("-")
+        print_dictionary(show_table)
+        print("---")
+        print("Projected Expected Earnings on Win (Parimutuel - with 20% takeout):")
+        print("-")
+        for horse, exp in projected_exp.items():
+            print(f"{horse}: {(0.8*exp):.4f}")
+        print("---")
+
     return bets
+'''
 
 
 ###########################################################################
