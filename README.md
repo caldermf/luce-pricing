@@ -7,3 +7,4 @@ This is a toy project inspired by the paper [Enumerative Theory for the Tsetlin 
 Bettors at the racetrack can ordinarily place three types of bets on these horses: to win, to place (2nd place or better) or to show (3rd place or better). The underlying assumption which we hope to exploit is that the "win" market is extremely efficient (bettors are very good at figuring out which horses will win) while the place and show markets are less so.
 
 The goal of this tool is to concretely implement this: to run the Luce model on weights given by actual data scraped from "win" bets on actual races, and to then search for inefficiencies in the corresponding "show" market.
+# horse-betting
